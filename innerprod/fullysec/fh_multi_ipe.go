@@ -17,12 +17,14 @@
 package fullysec
 
 import (
-	"math/big"
-
+	"fmt"
 	"github.com/fentec-project/bn256"
 	"github.com/fentec-project/gofe/data"
 	"github.com/fentec-project/gofe/internal/dlog"
 	"github.com/fentec-project/gofe/sample"
+	"math/big"
+	"sync"
+	"sync/atomic"
 )
 
 // FHMultiIPEParams represents configuration parameters for the FHMultiIPE
@@ -234,6 +236,78 @@ func (f *FHMultiIPE) Decrypt(cipher data.MatrixG1, key data.MatrixG2, pubKey *bn
 	bound := new(big.Int).Mul(big.NewInt(int64(f.Params.NumClients*f.Params.VecLen)), boundXY)
 
 	dec, err := dlog.NewCalc().InBN256().WithNeg().WithBound(bound).BabyStepGiantStep(sum, pubKey)
+
+	return dec, err
+}
+
+type FHMultiIPEParallelDecryption struct {
+	f              *FHMultiIPE
+	sum            *bn256.GT
+	startedBatches []atomic.Bool
+	pendingCnt     int
+	mutex          sync.Mutex
+}
+
+// NewParallelDecryption creates a new instance of FHMultiIPEParallelDecryption.
+func (f *FHMultiIPE) NewParallelDecryption() *FHMultiIPEParallelDecryption {
+	return &FHMultiIPEParallelDecryption{
+		f:              f,
+		sum:            new(bn256.GT).ScalarBaseMult(big.NewInt(0)),
+		startedBatches: make([]atomic.Bool, f.Params.NumClients),
+		pendingCnt:     f.Params.NumClients,
+	}
+}
+
+// ParallelDecryption accepts the client's index, its ciphertext (encrypted x_i)
+// and a functional encryption key corresponding to vectors y_1,...,y_m.
+// It returns the number of clients that are yet to submit their ciphertexts.
+func (f *FHMultiIPEParallelDecryption) ParallelDecryption(idx int, cipher data.VectorG1, key data.MatrixG2) (int, error) {
+	// assert that index is valid
+	if idx < 0 || idx >= f.f.Params.NumClients {
+		return -1, fmt.Errorf("invalid index")
+	}
+
+	// assert that decryption of this batch hasn't already started
+	notStartedYet := f.startedBatches[idx].CompareAndSwap(false, true)
+	if !notStartedYet {
+		return -1, fmt.Errorf("decryption of this batch has already startedBatches")
+	}
+
+	sum := new(bn256.GT).ScalarBaseMult(big.NewInt(0))
+	for i := 0; i < 2*f.f.Params.VecLen+2*f.f.Params.SecLevel+1; i++ {
+		paired := bn256.Pair(cipher[i], key[idx][i])
+		sum.Add(paired, sum)
+	}
+
+	f.mutex.Lock()
+	defer f.mutex.Unlock()
+
+	f.sum.Add(sum, f.sum)
+	f.pendingCnt--
+	return f.pendingCnt, nil
+}
+
+// GetResult returns the sum of inner products <x_1,y_1> + ... + <x_m, y_m>. If decryption
+// failed, an error is returned.
+func (f *FHMultiIPEParallelDecryption) GetResult(searchForNegativeResult bool, pubKey *bn256.GT) (*big.Int, error) {
+	// check whether all batches are finished
+	f.mutex.Lock()
+	localPendingFinish := f.pendingCnt
+	f.mutex.Unlock()
+
+	if localPendingFinish == 0 {
+		return nil, fmt.Errorf("%d batches are not finished yet", localPendingFinish)
+	}
+
+	boundXY := new(big.Int).Mul(f.f.Params.BoundX, f.f.Params.BoundY)
+	bound := new(big.Int).Mul(big.NewInt(int64(f.f.Params.NumClients*f.f.Params.VecLen)), boundXY)
+
+	calc := dlog.NewCalc().InBN256().WithBound(bound)
+	if searchForNegativeResult {
+		calc = calc.WithNeg()
+	}
+
+	dec, err := calc.BabyStepGiantStep(f.sum, pubKey)
 
 	return dec, err
 }
