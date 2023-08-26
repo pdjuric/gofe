@@ -295,7 +295,7 @@ func (f *FHMultiIPEParallelDecryption) GetResult(searchForNegativeResult bool, p
 	localPendingFinish := f.pendingCnt
 	f.mutex.Unlock()
 
-	if localPendingFinish == 0 {
+	if localPendingFinish > 0 {
 		return nil, fmt.Errorf("%d batches are not finished yet", localPendingFinish)
 	}
 
